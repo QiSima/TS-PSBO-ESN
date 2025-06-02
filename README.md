@@ -1,5 +1,5 @@
 # Enhancing Echo State Network with Reservoir State Selection for Time Series Forecasting
-This is the PyTorch implementation of the original paper, 'Enhancing Echo State Networks with Reservoir State Selection for Time Series Forecasting'. Here, a novel particle swarm Bayesian optimisation (PSBO) approach is proposed to adaptively select the most informative reservoir states within an echo state network (ESN) to enhance the performance of the ESN model in time series forecasting.
+This is the PyTorch implementation of the original paper, 'Enhancing Echo State Networks with Reservoir State Selection for Time Series Forecasting'. Here, a novel Particle Swarm Bayesian Optimisation (PSBO) approach is proposed to adaptively select the most informative reservoir states within an Echo State Network (ESN) to enhance the performance of the ESN model in time series forecasting.
 <p align="center">
     <img src="./assets/PSBO-ESN.png">
 </p>
