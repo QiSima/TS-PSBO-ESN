@@ -1,0 +1,326 @@
+import os
+import sys
+sys.path.append(os.path.join(os.path.dirname(__file__), os.path.pardir))
+from task.TaskLoader import Opt
+from models.Base import esnLayer
+import gc
+from tqdm import tqdm
+import torch
+import torch.nn as nn
+import numpy as np
+from  task.TaskLoader import rnn_dataset, torch_dataloader
+from tqdm import trange
+from task.metric import rmse
+
+class EchoStateNetwork(nn.Module):
+    """Basic Leaky Integrator Echo State Network (ESN)
+
+    'Jaeger, Herbert, et al. "Optimization and applications of echo state networks with leaky-integrator neurons." Neural networks 20.3 (2007): 335-352.'
+
+    Neuron reservoir with recurrent connection and random
+    weights. Leaky factor (or damping) ensure echoes in the network. No
+    learning takes place in the reservoir, readout is left at the user's
+    convience. The input processed by these ESN should be normalized in [-1, 1]
+
+    Parameters
+    ----------
+    Leaky rate : float, optional
+        Leaky (forget) factor for echoes, strong impact on the dynamic of the
+        reservoir. Possible values between 0 and 1, default is 1 which is equal to basic ESN.
+
+    weight_scaling : float, optional
+        Spectral radius of the reservoir, i.e. maximum eigenvalue of the weight
+        matrix, also strong impact on the dynamical properties of the reservoir.
+        Classical regimes involve values around 1, default is 0.9
+
+    discard_steps : int, optional
+        Discard first steps of the timeserie, to allow initialization of the
+        network dynamics.
+    """
+
+    def __init__(self, opts=None, logger=None):
+        super(EchoStateNetwork, self).__init__()
+        self.opts = opts
+        self.logger = logger
+
+        for (arg, value) in opts.dict.items():
+            self.logger.info("Argument %s: %r", arg, value)
+
+        self.Input_dim = opts.input_dim
+        self.Lag_order  = opts.lag_order
+        self.Time_steps = self.Lag_order - self.Input_dim + 1 
+
+        self.Horizon = opts.H
+    
+        self.Output_dim = opts.H
+        self.Hidden_Size = opts.hidden_size
+        self.Reg_lambda = opts.reg_lambda
+
+        self.device = opts.device
+        # self._device = self.device
+        self._device = torch.device('cpu')
+
+        assert opts.readout_steps > 0
+        self.Readout_steps = self.Time_steps if opts.readout_steps > self.Time_steps else opts.readout_steps
+        assert self.Readout_steps > 0
+
+
+        self.fc_io = opts.fc_io
+        if self.fc_io not in ['step', 'series', 'off']:
+            raise ValueError(
+                "Unknown fc_io type '{}'".format(self.fc_io)
+            )
+
+        self.init_arch()
+        self.loss_fn = nn.MSELoss()
+
+        if self.opts.device == torch.device('cpu'):
+            self.logger.info('Using CPU...')
+            self.usingCUDA = False
+        else:
+            self.logger.info('Using Cuda...')
+            self.to(self.opts.device)
+            self.usingCUDA = True
+            # self.gpu_tracker = MemTracker()
+
+        self.fit_info = Opt()
+
+    def init_arch(self,):
+        self.layer_esn = esnLayer(
+            hidden_size=self.Hidden_Size,
+            input_dim=self.Input_dim,
+            nonlinearity=self.opts.nonlinearity,
+            leaky_r=self.opts.leaky_r,
+            weight_scale=self.opts.weight_scaling,
+            iw_bound=self.opts.iw_bound,
+            hw_bound=self.opts.hw_bound,
+            device=self.device
+        )
+        self.layer_esn.freeze()
+
+        if self.fc_io == 'step':
+            self.readout_size = self.Hidden_Size + self.Input_dim
+        elif self.fc_io == 'series':
+            self.readout_size = self.Hidden_Size + self.Lag_order
+        else:
+            self.readout_size = self.Hidden_Size
+
+        self.readout = nn.Linear(
+            self.readout_size, self.Output_dim)
+        self.readout.weight.requires_grad = False
+        self.readout.bias.requires_grad = False
+
+    def check_state_strip(self, length):
+        state_select = False
+        for i in range(length):
+            if 'stripS_{}'.format(i) in self.opts.dict:
+                state_select = True
+                break
+        
+        if state_select:
+            for i in range(length):
+                if 'stripS_{}'.format(i) not in self.opts.dict:
+                    raise ValueError('Missing hyper config: "stripS_{}"!'.format(i))
+        
+        return state_select
+                
+
+    def init_state_strip(self,):
+        state_select = self.check_state_strip(self.Time_steps)
+        
+        if state_select:
+            self.stripS_operator = [self.opts.dict['stripS_{}'.format(i)] for i in range(self.Time_steps)]
+        else:
+            stripS_operator = np.zeros(self.Time_steps)
+            stripS_operator[-self.Readout_steps:] = 1
+            self.stripS_operator = stripS_operator.tolist()
+            
+        assert len(self.stripS_operator) == self.Time_steps
+
+    def data_loader(self, data, _batch_size = None):
+        '''
+        Transform the numpy array data into the pytorch data_loader
+        '''
+        data_batch_size = self.opts.batch_size if _batch_size is None else _batch_size
+        set_loader = torch_dataloader(rnn_dataset(data, self.Output_dim, self.Lag_order,self.Input_dim), batch_size= data_batch_size,cuda= self.usingCUDA)
+        return set_loader
+
+    def gen_series_x(self, x, device):
+        if self.fc_io == 'series':
+            series_x = torch.empty(size=(x.shape[0], self.Lag_order)).to(device)
+            series_x[:, :self.Time_steps] = x[:, 0, :self.Time_steps]
+            if self.Input_dim > 1:
+                series_x[:, self.Time_steps:] = x[:,1:, self.Time_steps -1]
+        else:
+            series_x = None
+
+        return series_x
+
+    def io_check(self, hidden, x):
+        x = x.to(self._device)
+        hidden = hidden.to(self._device)
+        if self.fc_io == 'step':
+            hidden = torch.cat(
+                (x, hidden), dim=1)
+        elif self.fc_io == 'series':
+            series_x = self.gen_series_x(x, self._device)
+            full_x = series_x.unsqueeze(2).repeat(1,1, hidden.shape[2])
+            hidden = torch.cat((full_x, hidden), dim=1)
+        
+        return hidden
+
+    def solve_output(self, Hidden_States, y):
+        t_hs = torch.cat((torch.ones(Hidden_States.size(0), 1).to(
+            self._device), Hidden_States), dim=1)
+        HTH = t_hs.T @ t_hs
+        HTY = t_hs.T @ y
+        # ridge regression with pytorch
+        I = (self.Reg_lambda * torch.eye(HTH.size(0))).to(self._device)
+        A = HTH + I
+        # orig_rank = torch.matrix_rank(HTH).item() # torch.matrix_rank is deprecated in favor of torch.linalg.matrix_rank in v1.9.0
+        orig_rank = torch.linalg.matrix_rank(A, hermitian=True).item()
+        tag = 'Inverse' if orig_rank == t_hs.size(1) else 'Pseudo-inverse'
+        if tag == 'Inverse':
+            W = torch.mm(torch.inverse(A), HTY).t()
+        else:
+            try:
+                # W = torch.mm(torch.linalg.pinv(A.to(self.device)),
+                #             HTY.to(self.device)).t().to(self._device)
+                W = torch.linalg.lstsq(A.cpu(), HTY.cpu(), driver = 'gelsd').solution.T.to(self._device)
+            except:
+                W = torch.mm(torch.linalg.pinv(A.cpu()),
+                            HTY.cpu()).t().to(self._device)
+        return W, tag
+
+    def update_readout(self, f_Hidden, x, y):
+        f_Hidden = self.io_check(f_Hidden, x)
+        
+        self.init_state_strip()
+        f_Hidden = self.stripS_process(f_Hidden)
+        y = self.stripS_process(y)
+        
+        W, tag = self.solve_output(f_Hidden, y)
+        self.readout.bias = nn.Parameter(W[:, 0], requires_grad=False)
+        self.readout.weight = nn.Parameter(W[:, 1:], requires_grad=False)
+        self.logger.info('Global LSM: {} \t L2 regular: {}'.format(
+            tag, 'True' if self.Reg_lambda != 0 else 'False'))
+
+    def stripS_process(self, state):
+        '''state shape: samples, dim, steps
+        '''  
+        select = []
+        read_operator = self.stripS_operator.copy()
+    
+        assert state.shape[2] == len(read_operator)
+        
+        for id, tag in enumerate(read_operator):
+            if int(tag) == 1:
+                select.append(state[:,:, id])
+    
+        if len(select) == 0:
+            select = state[:,:, -1:]
+        else:
+            select = torch.stack(select, dim=2).to(self._device)
+
+        select = select.permute(0, 2, 1)
+        select = torch.flatten(select, start_dim=0, end_dim=1).to(self._device)
+        return select
+    
+    def forward(self, x):
+        hidden = self.reservior_transform(x)
+        hidden = self.io_check(hidden, x)
+        output = self.readout(hidden[:,:,-1])
+        return output
+
+    def reservior_transform(self, x):
+        Hidden_States, _ = self.layer_esn(x)
+        Hidden_States = Hidden_States.to(self._device)
+        torch.cuda.empty_cache() if self.usingCUDA else gc.collect()
+        return Hidden_States
+
+    def batch_transform(self, data_loader, cat = True):
+        h_states = []
+        x = []
+        y = []
+        for batch_x, batch_y in tqdm(data_loader):
+            batch_x = batch_x.to(self.device)
+            batch_y = batch_y.to(self.device)
+            
+            # _h_states = self.reservior_transform(batch_x)
+            h_states.append(self.reservior_transform(batch_x).to(self._device))
+            
+            x.append(batch_x.to(self._device))
+            y.append(batch_y.to(self._device))
+            
+            torch.cuda.empty_cache() if self.usingCUDA else gc.collect()
+        
+        if cat:  
+            h_states = torch.cat(h_states, dim=0)
+            x = torch.cat(x, dim=0)
+            y = torch.cat(y, dim=0)
+        
+        return h_states, x, y
+
+    def xfit(self, train_data, val_data):
+        
+        # min_vmse = 9999
+        
+        train_loader = self.data_loader(train_data)
+        val_loader = self.data_loader(val_data)
+        h_states, x, y = self.batch_transform(train_loader)
+        
+        torch.cuda.empty_cache() if next(self.parameters()).is_cuda else gc.collect()
+
+        self.update_readout(h_states, x, y)
+        
+        pred = self.readout(self.io_check(h_states, x)[:,:,-1])
+        
+        y = y[:,:,-1].cpu().numpy()
+        pred = pred.cpu().numpy()
+        self.fit_info.trmse = rmse(y,pred)
+        # vh_states, val_x, val_y = self.batch_transform(val_loader)
+        # vpred = self.readout(self.io_check(vh_states, val_x)[:,:,-1])
+        _, val_y, vpred = self.loader_pred(val_loader)
+
+        self.fit_info.vrmse = rmse(val_y, vpred)
+
+        self.xfit_logger()
+
+        torch.cuda.empty_cache() if next(self.parameters()).is_cuda else gc.collect()
+
+        return self.fit_info
+
+    def xfit_logger(self,):
+        # self.logger.info('Hidden size: {}'.format(self.Hidden_Size))
+        self.logger.critical(
+            'Training RMSE: {:.4g} \t Validating RMSE: {:.4g}'.format(self.fit_info.trmse, self.fit_info.vrmse))
+
+    def predict(self, x):
+        x = torch.tensor(x).to(torch.float32).to(self.device)
+        output = self.forward(x)
+        pred = output.detach().cpu().numpy()
+        return pred
+    
+    def loader_pred(self, data_loader):
+        x = []
+        y = []
+        pred = []
+        for batch_x, batch_y in tqdm(data_loader):
+            batch_x = batch_x.to(self.device)
+            batch_y = batch_y[:,:,-1]
+            batch_pred = self.forward(batch_x)
+            x.append(batch_x.cpu())
+            y.append(batch_y.cpu())
+            pred.append(batch_pred.cpu())
+        x = torch.cat(x, dim=0).detach().numpy()
+        y = torch.cat(y, dim=0).detach().numpy()
+        pred = torch.cat(pred, dim=0).detach().numpy()
+        
+        return x, y, pred
+    
+    def task_pred(self, task_data):
+        self.eval()
+        data_loader = self.data_loader(task_data)
+        x, y, pred = self.loader_pred(data_loader)
+        
+        return x, y, pred       
